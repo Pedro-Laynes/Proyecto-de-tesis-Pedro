@@ -1,1 +1,443 @@
+# ===============================================
+# PIPELINE 1: AB1 → CONSENSO INICIAL CON REPORTE
+# Google Colab / Jupyter
+# ===============================================
+
+# ---------- Instala dependencias ----------
+import sys, subprocess, pkg_resources
+required = {"biopython","numpy","matplotlib","ipywidgets","pandas"}
+installed = {pkg.key for pkg in pkg_resources.working_set}
+missing = required - installed
+if missing:
+    subprocess.check_call([sys.executable, "-m", "pip", "install", *sorted(missing)])
+
+# ---------- Imports ----------
+import os, traceback, datetime
+from collections import defaultdict
+import numpy as np
+import matplotlib.pyplot as plt
+from Bio import SeqIO, pairwise2
+from Bio.Seq import Seq
+import ipywidgets as widgets
+from IPython.display import display, clear_output, HTML
+import pandas as pd
+
+IN_COLAB = "google.colab" in sys.modules
+if IN_COLAB:
+    from google.colab import files as gfiles
+
+
+# =====================================================
+#                    HELPERS
+# =====================================================
+
+def write_bytes_to_file(content_bytes, path):
+    with open(path, "wb") as fh: fh.write(content_bytes)
+
+# ---------- AB1 Reader ----------
+class AB1Reader:
+    def __init__(self, filepath):
+        self.filepath = filepath
+    def read(self):
+        rec = SeqIO.read(self.filepath, "abi")
+        seq = str(rec.seq)
+        qual = rec.letter_annotations.get("phred_quality", None)
+        abif = rec.annotations.get("abif_raw", {})
+        candidates = [("DATA9","DATA10","DATA11","DATA12"),
+                      ("DATA1","DATA2","DATA3","DATA4")]
+        traces = {}
+        for chs in candidates:
+            if all(c in abif for c in chs):
+                traces = {b: np.array(abif[ch]) for b,ch in zip(["A","C","G","T"], chs)}
+                break
+        if not traces:
+            keys = sorted([k for k in abif.keys() if k.startswith("DATA")])
+            if len(keys) >= 4:
+                traces = {b: np.array(abif[k]) for b,k in zip(["A","C","G","T"], keys[:4])}
+        return seq, qual, traces, rec
+
+
+# =====================================================
+#                     TRIMMING
+# =====================================================
+
+def simple_trim_by_Q(qual, Q=20):
+    if not qual: return 0,0
+    start = 0
+    while start < len(qual) and qual[start] < Q:
+        start += 1
+    end = len(qual)-1
+    while end >= 0 and qual[end] < Q:
+        end -= 1
+    return (start, end+1) if end >= start else (0,0)
+
+def mott_trim_indexes(qual, cutoff_prob=1e-4):
+    if not qual: return 0,0
+    scores = [cutoff_prob - (10 ** (-q/10.0)) for q in qual]
+    max_sum = curr = 0.0
+    start = end = s = 0
+    for i, sc in enumerate(scores):
+        curr += sc
+        if curr < 0:
+            curr = 0.0
+            s = i+1
+        if curr > max_sum:
+            max_sum = curr
+            start = s
+            end = i
+    if max_sum <= 0:
+        return simple_trim_by_Q(qual, Q=20)
+    return start, end+1
+
+def sliding_window_trim(qual, window=10, Q=20):
+    n = len(qual or [])
+    if n == 0:
+        return 0,0
+    left = None
+    for i in range(0, n-window+1):
+        if sum(q>=Q for q in qual[i:i+window])/window >= 0.5:
+            left=i
+            break
+    if left is None:
+        return 0,0
+    right = None
+    for j in range(n-window, -1, -1):
+        if sum(q>=Q for q in qual[j:j+window])/window >= 0.5:
+            right=j+window
+            break
+    return left, right if right is not None else n
+
+
+# =====================================================
+#                 CONSENSO SANGER
+# =====================================================
+
+IUPAC_MAP = {
+    frozenset(['A','G']):'R', frozenset(['C','T']):'Y',
+    frozenset(['G','C']):'S', frozenset(['A','T']):'W',
+    frozenset(['G','T']):'K', frozenset(['A','C']):'M'
+}
+
+def build_consensus_with_phred(seq_fw, qual_fw, seq_rv, qual_rv,
+                               q_threshold=20, use_iupac=True):
+
+    aln = pairwise2.align.globalms(seq_fw, seq_rv, 2, -1, -5, -0.5,
+                                   one_alignment_only=True)[0]
+    aln_fw, aln_rv = aln.seqA, aln.seqB
+
+    i_fw = i_rv = 0
+    consensus_bases = []
+    consensus_quals = []
+
+    for a,b in zip(aln_fw, aln_rv):
+        base_fw = base_rv = None
+        q_fw_val = q_rv_val = None
+
+        if a != "-":
+            base_fw = a
+            q_fw_val = qual_fw[i_fw] if qual_fw else None
+            i_fw += 1
+
+        if b != "-":
+            base_rv = b
+            q_rv_val = qual_rv[i_rv] if qual_rv else None
+            i_rv += 1
+
+        if base_fw is None and base_rv is None:
+            consensus_bases.append("N")
+            consensus_quals.append(0)
+            continue
+
+        if base_fw is None:
+            consensus_bases.append(base_rv)
+            consensus_quals.append(q_rv_val or 0)
+            continue
+
+        if base_rv is None:
+            consensus_bases.append(base_fw)
+            consensus_quals.append(q_fw_val or 0)
+            continue
+
+        if base_fw == base_rv:
+            consensus_bases.append(base_fw)
+            consensus_quals.append(max(q_fw_val or 0, q_rv_val or 0))
+            continue
+
+        qfw_v = q_fw_val if q_fw_val is not None else -1
+        qrv_v = q_rv_val if q_rv_val is not None else -1
+
+        if max(qfw_v, qrv_v) >= q_threshold:
+            pick = base_fw if qfw_v >= qrv_v else base_rv
+            consensus_bases.append(pick)
+            consensus_quals.append(max(qfw_v, qrv_v))
+            continue
+
+        sset = frozenset([base_fw, base_rv])
+        if use_iupac and sset in IUPAC_MAP:
+            consensus_bases.append(IUPAC_MAP[sset])
+            consensus_quals.append(min(qfw_v if qfw_v>0 else 0,
+                                       qrv_v if qrv_v>0 else 0))
+        else:
+            consensus_bases.append("N")
+            consensus_quals.append(min(qfw_v if qfw_v>0 else 0,
+                                       qrv_v if qrv_v>0 else 0))
+
+    seq_full = "".join(consensus_bases)
+    frags = [f for f in seq_full.split("N") if f]
+    final_seq = max(frags, key=len) if frags else seq_full
+    first_index = seq_full.find(final_seq)
+    final_qual = consensus_quals[first_index:first_index+len(final_seq)]
+
+    return final_seq, final_qual
+
+
+# =====================================================
+#                   PLOTS
+# =====================================================
+
+def plot_traces(traces, title="Chromatogram", figsize=(10,2.5), trim_range=None):
+    if not traces:
+        print("No hay traces disponibles.")
+        return
+    plt.figure(figsize=figsize)
+    for base,color in zip(["A","C","G","T"], ["green","blue","black","red"]):
+        if base in traces:
+            data = traces[base]
+            if trim_range:
+                s,e = trim_range
+                data = data[s:e]
+            plt.plot(data/np.max(data), label=base, linewidth=0.6)
+    plt.title(title)
+    plt.xlabel("Index")
+    plt.ylabel("Norm intensity")
+    plt.legend(loc="upper right", fontsize="small")
+    plt.show()
+
+
+# =====================================================
+#             PROCESAMIENTO DE PAREJA
+# =====================================================
+
+def process_pair_generic(p1, p2, trim_method="mott", q_val=20,
+                         sliding_window=12, iupac=True):
+
+    seq_fw, qual_fw, traces_fw, _ = AB1Reader(p1).read()
+    seq_rv, qual_rv, traces_rv, _ = AB1Reader(p2).read()
+
+    if trim_method=="mott":
+        fw_range = mott_trim_indexes(qual_fw, cutoff_prob=10**(-q_val/10))
+        rv_range = mott_trim_indexes(qual_rv, cutoff_prob=10**(-q_val/10))
+    elif trim_method=="sliding":
+        fw_range = sliding_window_trim(qual_fw, window=sliding_window, Q=q_val)
+        rv_range = sliding_window_trim(qual_rv, window=sliding_window, Q=q_val)
+    else:
+        fw_range = simple_trim_by_Q(qual_fw, Q=q_val)
+        rv_range = simple_trim_by_Q(qual_rv, Q=q_val)
+
+    seq_fw_trim = seq_fw[fw_range[0]:fw_range[1]]
+    qual_fw_trim = qual_fw[fw_range[0]:fw_range[1]] if qual_fw else None
+    seq_rv_trim = seq_rv[rv_range[0]:rv_range[1]]
+    qual_rv_trim = qual_rv[rv_range[0]:rv_range[1]] if qual_rv else None
+
+    consensus_seq, consensus_qual = build_consensus_with_phred(
+        seq_fw_trim, qual_fw_trim,
+        seq_rv_trim, qual_rv_trim,
+        q_threshold=q_val,
+        use_iupac=iupac
+    )
+
+    return {
+        "consensus_seq":consensus_seq,
+        "consensus_qual":consensus_qual,
+        "traces_fw":traces_fw,
+        "traces_rv":traces_rv,
+        "fw_trim_range":fw_range,
+        "rv_trim_range":rv_range,
+        "raw_len_fw":len(seq_fw),
+        "raw_len_rv":len(seq_rv),
+        "trim_len_fw":len(seq_fw_trim),
+        "trim_len_rv":len(seq_rv_trim)
+    }
+
+
+# =====================================================
+#                     STATE
+# =====================================================
+
+STATE = {
+    "last_consensus_fasta_path":None,
+    "manual_fw_path": None,
+    "manual_rv_path": None,
+    "rv_revcomp_seq": None,
+    "rv_revcomp_qual": None,
+    "rv_revcomp_active": False
+}
+
+
+# =====================================================
+#                       GUI
+# =====================================================
+
+upload_fw = widgets.FileUpload(accept=".ab1,.abi", multiple=False,
+                               description="Subir Forward AB1")
+upload_rv = widgets.FileUpload(accept=".ab1,.abi", multiple=False,
+                               description="Subir Reverse AB1")
+
+revcomp_button = widgets.Button(description="↻ Reverse Complement Reverse AB1",
+                                button_style="warning")
+
+run_button_new = widgets.Button(description="▶ Ejecutar análisis",
+                                button_style="success")
+
+reexecute_button = widgets.Button(description="↺ Re-ejecutar último",
+                                  button_style="primary")
+download_cons_button = widgets.Button(description="Descargar consenso (FASTA)",
+                                      button_style="info", disabled=True)
+
+trim_method = widgets.Dropdown(
+    options=[("Mott","mott"),("Sliding window","sliding"),("Simple Q-trim","simple")],
+    value="mott", description="Trim:"
+)
+q_threshold = widgets.IntSlider(value=20, min=10, max=40, description="Q:")
+sliding_window = widgets.IntSlider(value=12, min=6, max=30, description="Ventana:")
+use_iupac = widgets.Checkbox(value=True, description="Usar IUPAC")
+show_plots_checkbox = widgets.Checkbox(value=True, description="Mostrar cromatogramas")
+
+out = widgets.Output(layout={'border': '1px solid #3399ff', 'padding':'10px'})
+
+
+# ==============================================================
+#               MOSTRAR INTERFAZ COMPLETA
+# ==============================================================
+
+display(widgets.VBox([
+    widgets.HTML("<h3><b>SUBIDA DE ARCHIVOS SANGER</b></h3>"),
+    upload_fw,
+    upload_rv,
+    revcomp_button,
+    widgets.HTML("<hr>"),
+    trim_method, q_threshold, sliding_window, use_iupac,
+    run_button_new,
+    reexecute_button,
+    download_cons_button,
+    show_plots_checkbox,
+    out
+]))
+
+
+# =====================================================
+#              FUNCIONES DE SUBIDA Y BOTORES
+# =====================================================
+
+def save_single_ab1(widget, label):
+    os.makedirs("ab1_uploads", exist_ok=True)
+    if len(widget.value) == 0:
+        raise ValueError(f"No subiste archivo para {label}")
+    for fname, info in widget.value.items():
+        p = os.path.join("ab1_uploads", f"{label}.ab1")
+        write_bytes_to_file(info['content'], p)
+        return p
+
+
+# ---------- BOTÓN: REVERSE COMPLEMENT ----------
+def on_revcomp_clicked(b):
+    with out:
+        clear_output()
+        try:
+            rv_path = save_single_ab1(upload_rv, "reverse_original")
+            STATE["manual_rv_path"] = rv_path
+
+            # leer reverse
+            seq_rv, qual_rv, traces_rv, _ = AB1Reader(rv_path).read()
+
+            seq_rc = str(Seq(seq_rv).reverse_complement())
+            qual_rc = qual_rv[::-1] if qual_rv else None
+
+            STATE["rv_revcomp_seq"] = seq_rc
+            STATE["rv_revcomp_qual"] = qual_rc
+            STATE["rv_revcomp_active"] = True
+
+            print("✔ Reverse complement aplicado correctamente.")
+
+        except Exception as e:
+            print("Error generando reverse complement:", e)
+            traceback.print_exc()
+
+revcomp_button.on_click(on_revcomp_clicked)
+
+
+# ---------- BOTÓN: EJECUTAR ANÁLISIS ----------
+def on_run_clicked_new(b):
+    with out:
+        clear_output()
+        try:
+            fw_path = save_single_ab1(upload_fw, "forward")
+            STATE["manual_fw_path"] = fw_path
+
+            # Leer Forward
+            seq_fw, qual_fw, traces_fw, _ = AB1Reader(fw_path).read()
+
+            # Reverse (revcomp si se aplicó)
+            if STATE["rv_revcomp_active"]:
+                seq_rv = STATE["rv_revcomp_seq"]
+                qual_rv = STATE["rv_revcomp_qual"]
+                traces_rv = None
+                rv_path = STATE["manual_rv_path"]
+            else:
+                rv_path = save_single_ab1(upload_rv, "reverse")
+                seq_rv, qual_rv, traces_rv, _ = AB1Reader(rv_path).read()
+
+            # Procesar consenso
+            res = process_pair_generic(
+                p1=fw_path,
+                p2=rv_path,
+                trim_method=trim_method.value,
+                q_val=q_threshold.value,
+                sliding_window=sliding_window.value,
+                iupac=use_iupac.value
+            )
+
+            print("\n=== RESULTADO ===")
+            print(f"Forward crudo: {res['raw_len_fw']} bp")
+            print(f"Reverse crudo: {res['raw_len_rv']} bp")
+            print(f"Consenso final: {len(res['consensus_seq'])} bp\n")
+
+            # Guardar FASTA
+            os.makedirs("results", exist_ok=True)
+            timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+            fasta_path = f"results/consensus_{timestamp}.fasta"
+            with open(fasta_path,"w") as fh:
+                fh.write(f">consensus\n{res['consensus_seq']}\n")
+            STATE['last_consensus_fasta_path'] = fasta_path
+
+            download_cons_button.disabled = False
+            print(f"FASTA guardado en: {fasta_path}")
+
+            if show_plots_checkbox.value:
+                plot_traces(res['traces_fw'], "Forward", trim_range=res['fw_trim_range'])
+                plot_traces(res['traces_rv'],
+                            "Reverse (RevComp aplicado)" if STATE["rv_revcomp_active"] else "Reverse",
+                            trim_range=res['rv_trim_range'])
+
+        except Exception as e:
+            print("Error:", e)
+            traceback.print_exc()
+
+run_button_new.on_click(on_run_clicked_new)
+
+
+# ---------- BOTÓN: DESCARGAR ----------
+def on_download_cons_clicked(b):
+    with out:
+        clear_output()
+        path = STATE.get('last_consensus_fasta_path')
+        if not path or not os.path.exists(path):
+            print("No hay FASTA")
+            return
+        if IN_COLAB:
+            gfiles.download(path)
+        else:
+            print(f"Archivo guardado en: {path}")
+
+download_cons_button.on_click(on_download_cons_clicked)
 
