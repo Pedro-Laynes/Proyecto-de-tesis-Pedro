@@ -1,1 +1,171 @@
+# ===============================================
+# PIPELINE 2: CURADO AUTOMÁTICO DE CONSENSO
+# ===============================================
+
+# ---------- Instala dependencias ----------
+import sys, subprocess, pkg_resources
+required = {"biopython","ipywidgets","pandas"}
+installed = {pkg.key for pkg in pkg_resources.working_set}
+missing = required - installed
+if missing:
+    subprocess.check_call([sys.executable, "-m", "pip", "install", *sorted(missing)])
+
+# ---------- Imports ----------
+import os, traceback
+from Bio import SeqIO, pairwise2
+from Bio.Seq import Seq
+import ipywidgets as widgets
+from IPython.display import display, clear_output, HTML
+import pandas as pd
+
+IN_COLAB = "google.colab" in sys.modules
+if IN_COLAB:
+    from google.colab import files as gfiles
+
+# ---------- Helpers ----------
+def write_bytes_to_file(content_bytes, path):
+    with open(path, "wb") as fh:
+        fh.write(content_bytes)
+
+def read_fasta_file(path):
+    """Leer FASTA en modo texto, devolver lista de SeqRecord"""
+    with open(path, "r") as fh:
+        return list(SeqIO.parse(fh, "fasta"))
+
+# ---------- Curado ----------
+IUPAC_MAP = {
+    frozenset(['A','G']):'R', frozenset(['C','T']):'Y', frozenset(['G','C']):'S',
+    frozenset(['A','T']):'W', frozenset(['G','T']):'K', frozenset(['A','C']):'M'
+}
+
+def curate_consensus_against_reference(consensus_seq, reference_seq, iupac=True):
+    aln = pairwise2.align.globalms(consensus_seq, reference_seq, 2, -1, -5, -0.5, one_alignment_only=True)[0]
+    a_cons, a_ref = aln.seqA, aln.seqB
+    curated = []
+    for b_cons, b_ref in zip(a_cons, a_ref):
+        if b_cons == "-":
+            continue
+        if b_ref == "-":
+            curated.append(b_cons)
+            continue
+        if b_cons == b_ref:
+            curated.append(b_cons)
+        else:
+            if b_cons == "N" or (iupac and b_cons in ["R","Y","S","W","K","M"]):
+                curated.append(b_ref)
+            else:
+                curated.append(b_cons)
+    curated_seq = "".join(curated).strip("N")
+    return curated_seq
+
+# ---------- Estado ----------
+STATE = {
+    "consensus_path": None,
+    "reference_path": None,
+    "curated_path": None,
+    "report": ""
+}
+
+# ---------- Widgets ----------
+upload_cons_button = widgets.FileUpload(accept=".fa,.fasta,.fas", multiple=False, description="Subir consenso")
+upload_ref_button = widgets.FileUpload(accept=".fa,.fasta,.fas", multiple=False, description="Subir referencia")
+run_button = widgets.Button(description="▶ Ejecutar curado", button_style="success")
+download_button = widgets.Button(description="Descargar secuencia curada", button_style="info", disabled=True)
+reexecute_button = widgets.Button(description="↺ Re-ejecutar", button_style="warning")
+show_report_checkbox = widgets.Checkbox(value=True, description="Mostrar reporte")
+out = widgets.Output(layout={'border': '1px solid #3399ff','padding':'10px'})
+
+# ---------- Layout ----------
+ui = widgets.VBox([
+    widgets.HTML("<h2>Pipeline 2 — Curado de consenso</h2><hr>"),
+    widgets.HBox([upload_cons_button, upload_ref_button]),
+    widgets.HBox([run_button, download_button, reexecute_button, show_report_checkbox]),
+    out
+])
+display(ui)
+
+# ---------- Event handlers ----------
+def on_run_clicked(b):
+    with out:
+        clear_output()
+        try:
+            if not upload_cons_button.value or not upload_ref_button.value:
+                print("⚠️ Debes subir ambos archivos: consenso y referencia.")
+                return
+            # Crear carpeta resultados
+            os.makedirs("results", exist_ok=True)
+            # Guardar archivos
+            for name, info in upload_cons_button.value.items():
+                cons_path = os.path.join("results", name)
+                write_bytes_to_file(info['content'], cons_path)
+                STATE['consensus_path'] = cons_path
+            for name, info in upload_ref_button.value.items():
+                ref_path = os.path.join("results", name)
+                write_bytes_to_file(info['content'], ref_path)
+                STATE['reference_path'] = ref_path
+            # Leer secuencias en modo texto
+            cons_seq = str(read_fasta_file(STATE['consensus_path'])[0].seq)
+            ref_seq = str(read_fasta_file(STATE['reference_path'])[0].seq)
+            # Curado
+            curated_seq = curate_consensus_against_reference(cons_seq, ref_seq)
+            # Guardar FASTA curado con prefijo
+            base_name = os.path.splitext(os.path.basename(STATE['consensus_path']))[0]
+            curated_path = os.path.join("results", f"{base_name}_curated.fasta")
+            with open(curated_path, "w") as fh:
+                fh.write(f">{base_name}_curated\n{curated_seq}\n")
+            STATE['curated_path'] = curated_path
+            # Generar reporte
+            report = f"""
+===================== REPOORTE DE CURADO =====================
+Archivo consenso: {STATE['consensus_path']}
+Archivo referencia: {STATE['reference_path']}
+
+Tamaños:
+- Consenso previo: {len(cons_seq)} bp
+- Referencia: {len(ref_seq)} bp
+- Consenso curado final: {len(curated_seq)} bp
+
+Parámetros utilizados:
+- Curado automático de bases ambiguas N/IUPAC: {'Sí'}
+- Alineamiento global: match=2, mismatch=-1, gap_open=-5, gap_extend=-0.5
+==============================================================
+"""
+            STATE['report'] = report
+            if show_report_checkbox.value:
+                print(report)
+            download_button.disabled = False
+            print("✅ Curado completado. Secuencia guardada en:", curated_path)
+        except Exception as e:
+            print("❌ Error en curado:", e)
+            traceback.print_exc()
+
+def on_download_clicked(b):
+    with out:
+        clear_output()
+        if STATE['curated_path'] and os.path.exists(STATE['curated_path']):
+            print("Preparando descarga...")
+            if IN_COLAB:
+                gfiles.download(STATE['curated_path'])
+            else:
+                print("Archivo disponible en:", STATE['curated_path'])
+        else:
+            print("No hay archivo curado para descargar.")
+
+def on_reexecute_clicked(b):
+    with out:
+        clear_output()
+        print("Limpiando archivos previos...")
+        STATE['consensus_path'] = None
+        STATE['reference_path'] = None
+        STATE['curated_path'] = None
+        STATE['report'] = ""
+        upload_cons_button.value.clear()
+        upload_ref_button.value.clear()
+        download_button.disabled = True
+        print("Listo. Sube nuevas secuencias para procesar.")
+
+# ---------- Wire events ----------
+run_button.on_click(on_run_clicked)
+download_button.on_click(on_download_clicked)
+reexecute_button.on_click(on_reexecute_clicked)
 
